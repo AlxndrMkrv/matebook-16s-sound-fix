@@ -25,7 +25,6 @@ static const char *MIC_JACK_NAME = "Mic";
 static const char *HEADPHONE_JACK_NAME = "Headphone";
 static const char *MIC_KCTL_NAME = "Mic Jack";
 static const char *HEADPHONE_KCTL_NAME = "Headphone Jack";
-//static struct notifier_block nb;
 
 /*static irqreturn_t interrupt_handler(int irq, void *dev_id)
 {
@@ -34,16 +33,18 @@ static const char *HEADPHONE_KCTL_NAME = "Headphone Jack";
 	return IRQ_HANDLED;
 }*/
 
-static bool is_sound_card_valid(struct snd_card *card)
+static bool is_sound_card_valid(const struct snd_card *card)
 {
 	if (!card)
 		return false;
 
 	struct device *dev = card->ctl_dev;
-	struct pci_dev *pdev;
+	const struct pci_dev *pdev;
+	static const char PCI[] = "pci";
 
 	while (true) {
-		if (dev->bus != NULL && !strncmp(dev->bus->name, "pci", 3)) {
+		if (dev->bus != NULL &&
+		    !strncmp(dev->bus->name, PCI, sizeof(PCI))) {
 			pdev = container_of(dev, struct pci_dev, dev);
 
 			if (pdev != NULL) {
@@ -80,13 +81,15 @@ static struct hda_codec *get_codec(struct snd_card *card)
 	struct snd_device *dev;
 
 	list_for_each_entry(dev, &card->devices, list) {
-		if (dev->type == SNDRV_DEV_CODEC) {
-			codec = dev->device_data;
-			if (codec && codec->card == dev->card &&
-			    !strncmp(codec->core.chip_name, CHIP_NAME,
-				     strlen(CHIP_NAME)))
-				return codec;
-		}
+		if (dev->type != SNDRV_DEV_CODEC)
+			continue;
+
+		codec = dev->device_data;
+
+		if (codec && codec->card == dev->card &&
+		    !strncmp(codec->core.chip_name, CHIP_NAME,
+			     strlen(CHIP_NAME)))
+			return codec;
 	}
 
 	return NULL;
@@ -98,15 +101,74 @@ static struct snd_jack *get_jack(struct snd_card *card, const char *name)
 	struct snd_device *dev;
 
 	list_for_each_entry(dev, &card->devices, list) {
-		if (dev->type == SNDRV_DEV_JACK) {
-			jack = dev->device_data;
-			if (jack && !strncmp(jack->id, name, strlen(name)))
-				return jack;
-		}
+		if (dev->type != SNDRV_DEV_JACK)
+			continue;
+
+		jack = dev->device_data;
+
+		if (jack && !strncmp(jack->id, name, strlen(name)))
+			return jack;
 	}
 
 	return NULL;
 }
+
+static struct snd_soc_card *get_soc_sound_card(struct snd_card *card)
+{
+	struct snd_soc_card *soc_card = dev_get_drvdata(card->dev);
+
+	if (soc_card->snd_card != card)
+		return NULL;
+
+	return soc_card;
+}
+
+static struct snd_soc_jack *get_soc_jack(struct snd_soc_card *card)
+{
+	struct snd_soc_jack *jack = snd_soc_card_get_drvdata(card);
+
+	if (jack->card != card)
+		return NULL;
+
+	return jack;
+}
+
+static struct snd_soc_jack_gpio *get_soc_jack_gpio(struct snd_soc_card *card)
+{
+	struct snd_soc_jack_gpio *gpio = snd_soc_card_get_drvdata(card);
+
+	if (gpio->jack == NULL || gpio->jack->card != card)
+		return NULL;
+
+	return gpio;
+}
+
+static int jack_event_handler(struct notifier_block *nb, unsigned long event,
+			      void *data)
+{
+	//const struct snd_soc_jack *jack = data;
+
+	switch (event) {
+	case SND_JACK_HEADPHONE:
+		printk(KERN_INFO "Headphone plugged in\n");
+		break;
+	case SND_JACK_HEADSET:
+		printk(KERN_INFO "Headset plugged in\n");
+		break;
+	case SND_JACK_LINEOUT:
+		printk(KERN_INFO "Line out plugged in\n");
+		break;
+	default:
+		printk(KERN_INFO "Unknown jack event: %lu\n", event);
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block jack_nb = {
+	.notifier_call = jack_event_handler,
+};
 
 // MIC_JACK_NAME or HEADPHONE_JACK_NAME should be passed
 static struct snd_kcontrol *get_kcontrol(struct snd_soc_card *card,
@@ -115,24 +177,13 @@ static struct snd_kcontrol *get_kcontrol(struct snd_soc_card *card,
 	return snd_soc_card_get_kcontrol(card, name);
 }
 
-static struct snd_soc_card *get_soc_sound_card(struct snd_card *card)
-{
-	struct snd_soc_card *soc_card = dev_get_drvdata(card->dev);
-
-	if (soc_card->snd_card != card) {
-		return NULL;
-	}
-
-	return soc_card;
-}
-
-static void set_inverted_jack_detection(struct hda_codec *codec)
+/*static void set_inverted_jack_detection(struct hda_codec *codec)
 {
 	if (!codec)
 		return;
 
 	codec->inv_jack_detect = 1;
-}
+}*/
 
 static void print_card_components(struct snd_card *card)
 {
@@ -141,6 +192,9 @@ static void print_card_components(struct snd_card *card)
 	printk(KERN_INFO "snd_device on %s:", card->longname);
 
 	list_for_each_entry(dev, &card->devices, list) {
+		if (dev == NULL)
+			continue;
+
 		printk(KERN_INFO "    device on card: %d", dev->type);
 	}
 }
@@ -152,10 +206,16 @@ static void print_soc_card_components(struct snd_soc_card *card)
 	printk(KERN_INFO "soc_card_component on %s:", card->name);
 
 	for_each_card_components(card, comp) {
+		if (comp == NULL || comp->name == NULL ||
+		    comp->driver == NULL || comp->driver->name == NULL)
+			continue;
+
 		printk(KERN_INFO "    %s, driver: %s", comp->name,
 		       comp->driver->name);
 	}
 }
+
+static struct snd_soc_jack *soc_jack = NULL;
 
 static int __init init(void)
 {
@@ -172,11 +232,39 @@ static int __init init(void)
 
 	struct snd_soc_card *soc_card = get_soc_sound_card(card);
 
-	if (!soc_card) {
+	if (soc_card == NULL) {
 		printk(KERN_ERR "%s: failed go get SoC from sound card",
 		       module_name(THIS_MODULE));
 		return -ENODEV;
 	}
+
+	const struct snd_soc_jack_gpio *gpio = get_soc_jack_gpio(soc_card);
+
+	if (gpio == NULL) {
+		printk(KERN_ERR "%s: failed to get SoC Jack GPIO from SoC card",
+		       module_name(THIS_MODULE));
+		return -ENODEV;
+	}
+
+	soc_jack = get_soc_jack(soc_card);
+
+	if (soc_jack == NULL) {
+		printk(KERN_ERR "%s: failed to get MIC SoC Jack from SoC card",
+		       module_name(THIS_MODULE));
+		return -ENODEV;
+	}
+
+	printk(KERN_INFO "asdfasdf: %s", soc_jack->card->name);
+
+	// snd_soc_jack found!!!
+
+	printk(KERN_INFO "%s: soc_jack found. Status: %d",
+	       module_name(THIS_MODULE), soc_jack->status);
+
+	snd_soc_jack_notifier_register(soc_jack, &jack_nb);
+
+	printk(KERN_INFO "%s: notifier block registered",
+	       module_name(THIS_MODULE));
 
 	struct snd_jack *mic_jack = get_jack(card, MIC_JACK_NAME);
 
@@ -234,6 +322,10 @@ static int __init init(void)
 
 static void __exit cleanup(void)
 {
+	if (!soc_jack) {
+		snd_soc_jack_notifier_unregister(soc_jack, &jack_nb);
+	}
+
 	printk(KERN_ALERT "%s: cleanup\n", module_name(THIS_MODULE));
 }
 
